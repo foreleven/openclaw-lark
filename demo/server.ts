@@ -53,6 +53,7 @@ import { EchoBot, type InboundMessagePayload } from './lib/echo-bot.ts';
 import { createA2APluginRuntime } from './lib/a2a-plugin-runtime.ts';
 import { ChannelRegistry, type FeishuChannelConfig } from './lib/channel-registry.ts';
 import { ChannelRuntimeManager } from './lib/channel-runtime-manager.ts';
+import { FeishuSetupService, buildSetupPage, DEFAULT_SETUP_AGENT_ID } from './lib/feishu-setup.ts';
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -78,6 +79,7 @@ const ENV_FEISHU_DM_POLICY = (process.env['FEISHU_DM_POLICY'] ?? 'open') as
 const bot = new EchoBot();
 const registry = new ChannelRegistry();
 const manager = new ChannelRuntimeManager(registry);
+const setup = new FeishuSetupService(registry, manager);
 
 // Auto-register a default binding from env vars when all three required vars
 // are set: FEISHU_APP_ID, FEISHU_APP_SECRET, and A2A_AGENT_URL.
@@ -160,6 +162,9 @@ async function handleRequest(req: Request): Promise<Response> {
         'POST /bindings/feishu/:agentId/auth': 'Trigger OAuth / onboarding',
         'GET  /a2a/status': 'Probe remote A2A agent (query: ?url=)',
         'POST /a2a/run': 'Dispatch task to remote A2A agent',
+        'GET  /setup/feishu': 'Feishu bot setup page (QR code scan to bind)',
+        'POST /setup/feishu/start': 'Start Feishu QR device-flow session',
+        'GET  /setup/feishu/status/:sessionId': 'Poll QR session status',
       },
     });
   }
@@ -508,6 +513,90 @@ async function handleRequest(req: Request): Promise<Response> {
     }
   }
 
+  // ──────────────────────────────────────────────────────────────────────────
+  // Feishu QR code setup flow
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // GET /setup/feishu — Setup HTML page (QR code scan to bind agentId="1")
+  if (pathname === '/setup/feishu' && method === 'GET') {
+    const binding = registry.get(DEFAULT_SETUP_AGENT_ID);
+    const alreadyRegistered = !!binding;
+    const registeredStatus = alreadyRegistered ? JSON.stringify(manager.getStatus(DEFAULT_SETUP_AGENT_ID)) : undefined;
+    const html = buildSetupPage({
+      defaultAppId: binding?.config.appId || ENV_FEISHU_APP_ID || '',
+      defaultA2aAgentUrl: binding?.a2aAgentUrl || ENV_A2A_AGENT_URL || '',
+      alreadyRegistered,
+      registeredStatus,
+    });
+    return new Response(html, {
+      status: 200,
+      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    });
+  }
+
+  // POST /setup/feishu/start — Initiate Feishu device-flow QR session
+  if (pathname === '/setup/feishu/start' && method === 'POST') {
+    let body: {
+      appId?: string;
+      appSecret?: string;
+      brand?: 'feishu' | 'lark';
+      a2aAgentUrl?: string;
+      scope?: string;
+    };
+    try {
+      body = (await req.json()) as typeof body;
+    } catch {
+      return json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    const appId = body.appId?.trim() || ENV_FEISHU_APP_ID;
+    const appSecret = body.appSecret?.trim() || ENV_FEISHU_APP_SECRET;
+
+    if (!appId) return json({ error: 'Missing required field: appId' }, 400);
+    if (!appSecret) return json({ error: 'Missing required field: appSecret' }, 400);
+
+    try {
+      const session = await setup.startQrFlow({
+        appId,
+        appSecret,
+        brand: body.brand ?? (ENV_FEISHU_DOMAIN as 'feishu' | 'lark'),
+        a2aAgentUrl: body.a2aAgentUrl || ENV_A2A_AGENT_URL || undefined,
+        scope: body.scope,
+      });
+      return json({
+        sessionId: session.sessionId,
+        agentId: session.agentId,
+        userCode: session.userCode,
+        verificationUri: session.verificationUri,
+        verificationUriComplete: session.verificationUriComplete,
+        expiresAt: session.expiresAt,
+        interval: 5,
+      }, 201);
+    } catch (err) {
+      console.error('[server] setup QR flow failed:', err);
+      return json({ error: 'Failed to start QR setup flow', reason: safeErrorMessage(err) }, 500);
+    }
+  }
+
+  // GET /setup/feishu/status/:sessionId — Poll for QR session status
+  const setupStatusMatch = pathname.match(/^\/setup\/feishu\/status\/([^/]+)$/);
+  if (setupStatusMatch && method === 'GET') {
+    const sessionId = decodeURIComponent(setupStatusMatch[1]!);
+    const session = setup.getSession(sessionId);
+    if (!session) {
+      return json({ error: `No QR session found for sessionId "${sessionId}"` }, 404);
+    }
+    return json({
+      sessionId: session.sessionId,
+      agentId: session.agentId,
+      status: session.status,
+      errorMessage: session.errorMessage,
+      expiresAt: session.expiresAt,
+      // Include binding status if authorized
+      bindingStatus: session.status === 'authorized' ? manager.getStatus(session.agentId) : null,
+    });
+  }
+
   return json({ error: 'Not Found' }, 404);
 }
 
@@ -516,6 +605,9 @@ async function handleRequest(req: Request): Promise<Response> {
 // ---------------------------------------------------------------------------
 
 const server = Bun.serve({ port: PORT, fetch: handleRequest });
+
+// Periodically clean up expired QR sessions (every 30 minutes).
+setInterval(() => setup.cleanupExpired(), 30 * 60 * 1000);
 
 const bindingCount = registry.size;
 const runningCount = manager.listEntries().filter((e) => e.plugin.gatewayRunning).length;
@@ -531,6 +623,9 @@ console.info([
   '',
   `  Quick start:`,
   `    curl http://localhost:${PORT}/`,
+  `    # QR code bot setup (scan with Feishu app):`,
+  `    open http://localhost:${PORT}/setup/feishu`,
+  `    # Or register via API:`,
   `    curl -X POST http://localhost:${PORT}/bindings/feishu \\`,
   `      -H 'Content-Type: application/json' \\`,
   `      -d '{"agentId":"my-agent","a2aAgentUrl":"http://localhost:4000",`,
