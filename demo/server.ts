@@ -1,99 +1,115 @@
 /**
- * Demo Bun Server
+ * OpenClaw Lark — Bun HTTP Server
  *
- * A self-contained HTTP server that:
- *   1. Loads the `@larksuite/openclaw-lark` channel plugin via the plugin loader
- *   2. Runs an Echo Bot that replies to simulated channel messages
- *   3. Optionally wires up an A2A-backed plugin runtime for real sub-agent calls
- *   4. Exposes REST endpoints for testing the full message round-trip
- *   5. Can start the Feishu WebSocket gateway so real Feishu messages are
- *      forwarded to the A2A agent and replies sent back via Feishu
+ * Architecture
+ * ────────────
+ * • ChannelRegistry  — in-memory service that stores agent-ID → channel-binding
+ *                      mappings (including Feishu app credentials).
+ * • ChannelRuntimeManager — reads the registry, manages one LoadedPlugin
+ *                      instance per binding, and starts/stops each gateway.
+ * • HTTP API         — CRUD for bindings + login/auth operations that
+ *                      replace the openclaw CLI commands.
  *
- * Usage:
- *   bun run server.ts                                # start on default port 3000
- *   PORT=8080 bun run server.ts                      # custom port
- *   A2A_AGENT_URL=http://localhost:4000 bun run server.ts  # enable A2A runtime
+ * Quick start (no Feishu creds):
+ *   bun run server.ts
+ *   curl http://localhost:3000/
+ *   curl -X POST http://localhost:3000/message -d '{"text":"hi"}'
  *
- *   # Full Feishu ↔ A2A bridge (gateway auto-starts when all 3 vars are set):
+ * Auto-register a Feishu binding from env vars on startup:
  *   FEISHU_APP_ID=cli_xxx \
  *   FEISHU_APP_SECRET=xxx \
  *   A2A_AGENT_URL=http://localhost:4000 \
  *   bun run server.ts
  *
- * Endpoints:
- *   GET  /                → health check & plugin info
- *   GET  /plugin          → detailed plugin registration info
- *   POST /message         → send a simulated inbound message (JSON body)
- *   GET  /history         → retrieve echo bot conversation history
- *   POST /clear           → clear conversation history
- *   GET  /a2a/status      → A2A runtime connection status
- *   POST /a2a/run         → dispatch a sub-agent task via the A2A runtime
- *   GET  /gateway/status  → Feishu WebSocket gateway status
- *   POST /gateway/start   → start the Feishu WebSocket gateway
- *   DELETE /gateway/stop  → stop the Feishu WebSocket gateway
+ * Or register dynamically:
+ *   curl -X POST http://localhost:3000/bindings/feishu \
+ *     -H 'Content-Type: application/json' \
+ *     -d '{"agentId":"my-agent","a2aAgentUrl":"http://localhost:4000",
+ *          "appId":"cli_xxx","appSecret":"xxx"}'
+ *
+ * Endpoints
+ * ─────────
+ *   GET  /                              health + registry summary
+ *   GET  /plugin                        first loaded plugin registration info
+ *   POST /message                       echo bot: simulate inbound message
+ *   GET  /history                       echo bot history
+ *   POST /clear                         clear echo bot history
+ *
+ *   GET  /bindings                      list all bindings + runtime status
+ *   POST /bindings/feishu               create/replace Feishu binding
+ *   DELETE /bindings/feishu/:agentId    remove binding (stops gateway)
+ *   GET  /bindings/feishu/:agentId/status     runtime status for one agent
+ *   POST /bindings/feishu/:agentId/start      start Feishu gateway
+ *   POST /bindings/feishu/:agentId/stop       stop Feishu gateway
+ *   POST /bindings/feishu/:agentId/restart    restart Feishu gateway
+ *   POST /bindings/feishu/:agentId/probe      test Feishu credentials
+ *   POST /bindings/feishu/:agentId/auth       trigger OAuth / onboarding
+ *
+ *   GET  /a2a/status                    probe a remote A2A agent
+ *   POST /a2a/run                       dispatch task to remote A2A agent
  */
 
-import { loadPlugin, type LoadedPlugin } from './lib/plugin-loader.ts';
 import { EchoBot, type InboundMessagePayload } from './lib/echo-bot.ts';
 import { createA2APluginRuntime } from './lib/a2a-plugin-runtime.ts';
+import { ChannelRegistry, type FeishuChannelConfig } from './lib/channel-registry.ts';
+import { ChannelRuntimeManager } from './lib/channel-runtime-manager.ts';
 
 // ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
 
 const PORT = Number(process.env.PORT) || 3000;
-const A2A_AGENT_URL = process.env['A2A_AGENT_URL'] ?? '';
 
-// Feishu credentials (optional) — when set the gateway auto-starts
-const FEISHU_APP_ID = process.env['FEISHU_APP_ID'] ?? '';
-const FEISHU_APP_SECRET = process.env['FEISHU_APP_SECRET'] ?? '';
-const FEISHU_VERIFICATION_TOKEN = process.env['FEISHU_VERIFICATION_TOKEN'] ?? '';
-const FEISHU_ENCRYPT_KEY = process.env['FEISHU_ENCRYPT_KEY'] ?? '';
-const FEISHU_DOMAIN = (process.env['FEISHU_DOMAIN'] ?? 'feishu') as 'feishu' | 'lark';
-const FEISHU_REQUIRE_MENTION = process.env['FEISHU_REQUIRE_MENTION'] === 'true';
-const FEISHU_DM_POLICY = (process.env['FEISHU_DM_POLICY'] ?? 'open') as 'open' | 'pairing' | 'allowlist' | 'disabled';
+// Optional "default binding" assembled from env vars at startup.
+const ENV_A2A_AGENT_URL = process.env['A2A_AGENT_URL'] ?? '';
+const ENV_FEISHU_APP_ID = process.env['FEISHU_APP_ID'] ?? '';
+const ENV_FEISHU_APP_SECRET = process.env['FEISHU_APP_SECRET'] ?? '';
+const ENV_FEISHU_VERIFICATION_TOKEN = process.env['FEISHU_VERIFICATION_TOKEN'] ?? '';
+const ENV_FEISHU_ENCRYPT_KEY = process.env['FEISHU_ENCRYPT_KEY'] ?? '';
+const ENV_FEISHU_DOMAIN = (process.env['FEISHU_DOMAIN'] ?? 'feishu') as 'feishu' | 'lark';
+const ENV_FEISHU_REQUIRE_MENTION = process.env['FEISHU_REQUIRE_MENTION'] === 'true';
+const ENV_FEISHU_DM_POLICY = (process.env['FEISHU_DM_POLICY'] ?? 'open') as
+  'open' | 'pairing' | 'allowlist' | 'disabled';
 
-const hasFeishuCredentials = !!(FEISHU_APP_ID && FEISHU_APP_SECRET);
+// ---------------------------------------------------------------------------
+// Services
+// ---------------------------------------------------------------------------
 
 const bot = new EchoBot();
+const registry = new ChannelRegistry();
+const manager = new ChannelRuntimeManager(registry);
 
-let plugin: LoadedPlugin | null = null;
-let pluginError: string | null = null;
-
-try {
-  plugin = await loadPlugin({
-    a2aAgentUrl: A2A_AGENT_URL || undefined,
-    feishuAccount: hasFeishuCredentials
-      ? {
-          appId: FEISHU_APP_ID,
-          appSecret: FEISHU_APP_SECRET,
-          verificationToken: FEISHU_VERIFICATION_TOKEN || undefined,
-          encryptKey: FEISHU_ENCRYPT_KEY || undefined,
-          connectionMode: 'websocket',
-          dmPolicy: FEISHU_DM_POLICY,
-          requireMention: FEISHU_REQUIRE_MENTION,
-        }
-      : undefined,
+// Auto-register a default binding from env vars when all three required vars
+// are set: FEISHU_APP_ID, FEISHU_APP_SECRET, and A2A_AGENT_URL.
+if (ENV_FEISHU_APP_ID && ENV_FEISHU_APP_SECRET && ENV_A2A_AGENT_URL) {
+  registry.register({
+    agentId: 'default',
+    a2aAgentUrl: ENV_A2A_AGENT_URL,
+    channelId: 'feishu',
+    config: {
+      appId: ENV_FEISHU_APP_ID,
+      appSecret: ENV_FEISHU_APP_SECRET,
+      verificationToken: ENV_FEISHU_VERIFICATION_TOKEN || undefined,
+      encryptKey: ENV_FEISHU_ENCRYPT_KEY || undefined,
+      connectionMode: 'websocket',
+      dmPolicy: ENV_FEISHU_DM_POLICY,
+      requireMention: ENV_FEISHU_REQUIRE_MENTION,
+      domain: ENV_FEISHU_DOMAIN,
+    },
   });
-} catch (err) {
-  // Log full error to console for debugging, but only expose the message
-  // to HTTP responses (avoid stack-trace leakage).
-  console.error('[server] plugin load failed:', err);
-  pluginError = safeErrorMessage(err);
-}
+  console.info('[server] default binding registered from env vars (agentId: "default")');
 
-// Auto-start the Feishu gateway when all required credentials are available
-if (plugin && hasFeishuCredentials && A2A_AGENT_URL) {
+  // Auto-start the gateway for the default binding
   try {
-    await plugin.startGateway();
-    console.info('[server] Feishu WebSocket gateway started (auto-start)');
+    await manager.start('default');
+    console.info('[server] default Feishu gateway started (auto-start)');
   } catch (err) {
-    console.error('[server] Failed to auto-start Feishu gateway:', err);
+    console.error('[server] failed to auto-start default gateway:', err);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Route helpers
+// Helpers
 // ---------------------------------------------------------------------------
 
 function json(data: unknown, status = 200): Response {
@@ -103,67 +119,65 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
-/**
- * Return a safe error summary for HTTP responses.
- * Strips stack trace lines and file paths so internal details don't leak
- * to clients. Full errors are always logged to console for debugging.
- */
 function safeErrorMessage(err: unknown): string {
   if (!(err instanceof Error)) return 'An error occurred';
-  // Strip stack trace lines (lines starting with whitespace followed by "at ")
   const msg = err.message.split('\n')[0] ?? '';
-  // Remove file paths (e.g. /home/runner/... or C:\Users\...)
   return msg.replace(/\/[^\s:]+|[A-Z]:\\[^\s:]*/g, '[path]').trim() || 'An error occurred';
 }
 
 // ---------------------------------------------------------------------------
-// Request handler
+// Request router
 // ---------------------------------------------------------------------------
 
 async function handleRequest(req: Request): Promise<Response> {
   const url = new URL(req.url);
-  const { pathname } = url;
+  const { pathname, method } = { pathname: url.pathname, method: req.method };
 
-  // GET / — health check
-  if (pathname === '/' && req.method === 'GET') {
-    const channelPlugin = plugin?.channel?.plugin;
+  // ──────────────────────────────────────────────────────────────────────────
+  // GET / — health + registry summary
+  // ──────────────────────────────────────────────────────────────────────────
+  if (pathname === '/' && method === 'GET') {
+    const bindings = registry.list();
+    const entries = manager.listEntries();
     return json({
       status: 'ok',
-      pluginLoaded: plugin !== null,
-      pluginError,
-      a2aEnabled: plugin?.a2aEnabled ?? false,
-      a2aAgentUrl: A2A_AGENT_URL || null,
-      feishuCredentials: hasFeishuCredentials,
-      gatewayRunning: plugin?.gatewayRunning ?? false,
-      channel: channelPlugin
-        ? {
-            id: channelPlugin.id,
-            meta: channelPlugin.meta,
-            capabilities: channelPlugin.capabilities,
-          }
-        : null,
+      bindingCount: bindings.length,
+      runningCount: entries.filter((e) => e.plugin.gatewayRunning).length,
       endpoints: {
-        'GET /': 'Health check & plugin info',
-        'GET /plugin': 'Detailed plugin registration info',
-        'POST /message': 'Send a simulated inbound message',
-        'GET /history': 'Get echo bot conversation history',
-        'POST /clear': 'Clear conversation history',
-        'GET /a2a/status': 'A2A runtime connection status',
-        'POST /a2a/run': 'Dispatch a sub-agent task via the A2A runtime',
-        'GET /gateway/status': 'Feishu WebSocket gateway status',
-        'POST /gateway/start': 'Start the Feishu WebSocket gateway',
-        'DELETE /gateway/stop': 'Stop the Feishu WebSocket gateway',
+        'GET  /': 'Health + registry summary',
+        'GET  /plugin': 'First loaded plugin registration info',
+        'POST /message': 'Echo bot — simulate inbound message',
+        'GET  /history': 'Echo bot history',
+        'POST /clear': 'Clear echo bot history',
+        'GET  /bindings': 'List all bindings + status',
+        'POST /bindings/feishu': 'Create/replace Feishu binding',
+        'DELETE /bindings/feishu/:agentId': 'Remove binding + stop gateway',
+        'GET  /bindings/feishu/:agentId/status': 'Status for one agent',
+        'POST /bindings/feishu/:agentId/start': 'Start Feishu gateway',
+        'POST /bindings/feishu/:agentId/stop': 'Stop Feishu gateway',
+        'POST /bindings/feishu/:agentId/restart': 'Restart Feishu gateway',
+        'POST /bindings/feishu/:agentId/probe': 'Test Feishu credentials',
+        'POST /bindings/feishu/:agentId/auth': 'Trigger OAuth / onboarding',
+        'GET  /a2a/status': 'Probe remote A2A agent (query: ?url=)',
+        'POST /a2a/run': 'Dispatch task to remote A2A agent',
       },
     });
   }
 
-  // GET /plugin — detailed registration info
-  if (pathname === '/plugin' && req.method === 'GET') {
-    if (!plugin) {
-      return json({ error: 'Plugin not loaded', reason: pluginError }, 500);
+  // ──────────────────────────────────────────────────────────────────────────
+  // GET /plugin — first loaded plugin's registration info
+  // ──────────────────────────────────────────────────────────────────────────
+  if (pathname === '/plugin' && method === 'GET') {
+    const entry = manager.listEntries()[0];
+    if (!entry) {
+      return json({
+        error: 'No plugin loaded yet',
+        hint: 'POST /bindings/feishu to register an agent binding first',
+      }, 404);
     }
-    const reg = plugin.registration;
+    const reg = entry.plugin.registration;
     return json({
+      agentId: entry.binding.agentId,
       channels: reg.channels.map((c) => ({
         id: c.plugin.id,
         meta: c.plugin.meta,
@@ -175,20 +189,20 @@ async function handleRequest(req: Request): Promise<Response> {
     });
   }
 
-  // POST /message — simulate an inbound channel message
-  if (pathname === '/message' && req.method === 'POST') {
+  // ──────────────────────────────────────────────────────────────────────────
+  // Echo bot
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // POST /message
+  if (pathname === '/message' && method === 'POST') {
     let body: InboundMessagePayload;
     try {
       body = (await req.json()) as InboundMessagePayload;
     } catch {
       return json({ error: 'Invalid JSON body' }, 400);
     }
+    if (!body.text) return json({ error: 'Missing required field: text' }, 400);
 
-    if (!body.text) {
-      return json({ error: 'Missing required field: text' }, 400);
-    }
-
-    // Apply defaults
     const payload: InboundMessagePayload = {
       messageId: body.messageId || `msg_${Date.now()}`,
       chatId: body.chatId || 'demo_chat_001',
@@ -197,167 +211,300 @@ async function handleRequest(req: Request): Promise<Response> {
       chatType: body.chatType || 'p2p',
     };
 
-    // Fire registered hooks if any listeners exist
-    if (plugin) {
-      await plugin.emitHook('message_received', { message: payload }, { sessionKey: payload.chatId });
+    // Fire hooks on all loaded plugins
+    for (const entry of manager.listEntries()) {
+      await entry.plugin.emitHook(
+        'message_received',
+        { message: payload },
+        { sessionKey: payload.chatId },
+      ).catch((err: unknown) => {
+        console.error(`[server] emitHook error for agent "${entry.binding.agentId}":`, err);
+      });
     }
 
-    // Echo bot processes the message
-    const reply = bot.handleMessage(payload);
-
-    return json({
-      inbound: payload,
-      reply,
-    });
+    return json({ inbound: payload, reply: bot.handleMessage(payload) });
   }
 
-  // GET /history — conversation log
-  if (pathname === '/history' && req.method === 'GET') {
+  // GET /history
+  if (pathname === '/history' && method === 'GET') {
     return json({ history: bot.getHistory() });
   }
 
-  // POST /clear — reset conversation
-  if (pathname === '/clear' && req.method === 'POST') {
+  // POST /clear
+  if (pathname === '/clear' && method === 'POST') {
     bot.clearHistory();
     return json({ status: 'cleared' });
   }
 
-  // ---------------------------------------------------------------------------
-  // A2A endpoints
-  // ---------------------------------------------------------------------------
+  // ──────────────────────────────────────────────────────────────────────────
+  // Binding management — /bindings/feishu[/:agentId[/action]]
+  // ──────────────────────────────────────────────────────────────────────────
 
-  // GET /a2a/status — A2A runtime connection status
-  if (pathname === '/a2a/status' && req.method === 'GET') {
-    if (!A2A_AGENT_URL) {
-      return json({
-        enabled: false,
-        message: 'Set A2A_AGENT_URL env var to enable the A2A runtime',
-      });
-    }
-
-    // Probe the agent card
-    try {
-      const a2aRuntime = createA2APluginRuntime({ agentUrl: A2A_AGENT_URL });
-      const card = await a2aRuntime.a2a.getAgentCard();
-      return json({ enabled: true, agentUrl: A2A_AGENT_URL, agentCard: card });
-    } catch (err) {
-      return json({
-        enabled: false,
-        agentUrl: A2A_AGENT_URL,
-        error: safeErrorMessage(err),
-      }, 503);
-    }
+  // GET /bindings — list all bindings with runtime status
+  if (pathname === '/bindings' && method === 'GET') {
+    const bindings = registry.list().map((b) => ({
+      ...b,
+      config: { ...b.config, appSecret: '[redacted]' },
+      status: manager.getStatus(b.agentId),
+    }));
+    return json({ bindings });
   }
 
-  // POST /a2a/run — dispatch a sub-agent task
-  if (pathname === '/a2a/run' && req.method === 'POST') {
-    if (!A2A_AGENT_URL) {
-      return json(
-        { error: 'A2A runtime not configured. Set A2A_AGENT_URL env var.' },
-        501,
-      );
-    }
-
-    let body: { message: string; sessionKey?: string; wait?: boolean; timeoutMs?: number };
+  // POST /bindings/feishu — create or replace a Feishu binding
+  if (pathname === '/bindings/feishu' && method === 'POST') {
+    let body: { agentId: string; a2aAgentUrl: string } & FeishuChannelConfig;
     try {
       body = (await req.json()) as typeof body;
     } catch {
       return json({ error: 'Invalid JSON body' }, 400);
     }
 
-    if (!body.message) {
-      return json({ error: 'Missing required field: message' }, 400);
+    const { agentId, a2aAgentUrl, ...channelCfg } = body;
+
+    if (!agentId?.trim()) return json({ error: 'Missing required field: agentId' }, 400);
+    if (!a2aAgentUrl?.trim()) return json({ error: 'Missing required field: a2aAgentUrl' }, 400);
+    if (!channelCfg.appId?.trim()) return json({ error: 'Missing required field: appId' }, 400);
+    if (!channelCfg.appSecret?.trim()) return json({ error: 'Missing required field: appSecret' }, 400);
+
+    // If already running, stop first so the new config takes effect
+    if (manager.isRunning(agentId)) {
+      manager.stop(agentId);
     }
 
-    const a2aRuntime = createA2APluginRuntime({ agentUrl: A2A_AGENT_URL });
-    const subagent = a2aRuntime.subagent as {
+    const binding = registry.register({
+      agentId,
+      a2aAgentUrl,
+      channelId: 'feishu',
+      config: channelCfg as FeishuChannelConfig,
+    });
+
+    // Automatically start the gateway for the new binding
+    try {
+      await manager.start(agentId);
+    } catch (err) {
+      console.error(`[server] gateway start failed for agent "${agentId}":`, err);
+      return json({
+        binding: { ...binding, config: { ...binding.config, appSecret: '[redacted]' } },
+        started: false,
+        error: safeErrorMessage(err),
+      }, 207);
+    }
+
+    return json({
+      binding: { ...binding, config: { ...binding.config, appSecret: '[redacted]' } },
+      started: true,
+      status: manager.getStatus(agentId),
+    }, 201);
+  }
+
+  // Routes that require /:agentId segment: /bindings/feishu/:agentId[/action]
+  const feishuBindingMatch = pathname.match(/^\/bindings\/feishu\/([^/]+)(\/[^/]+)?$/);
+  if (feishuBindingMatch) {
+    const agentId = decodeURIComponent(feishuBindingMatch[1]!);
+    const action = feishuBindingMatch[2]; // e.g. "/start", "/stop", "/status", etc.
+
+    // DELETE /bindings/feishu/:agentId — remove binding
+    if (!action && method === 'DELETE') {
+      manager.stop(agentId);
+      const existed = registry.unregister(agentId);
+      if (!existed) return json({ error: `No binding found for agentId "${agentId}"` }, 404);
+      return json({ status: 'removed', agentId });
+    }
+
+    // All remaining actions require the binding to exist
+    if (!action && method !== 'DELETE') {
+      return json({ error: 'Method not allowed' }, 405);
+    }
+
+    const binding = registry.get(agentId);
+    if (!binding) {
+      return json({ error: `No binding found for agentId "${agentId}"` }, 404);
+    }
+
+    // GET /bindings/feishu/:agentId/status
+    if (action === '/status' && method === 'GET') {
+      return json(manager.getStatus(agentId));
+    }
+
+    // POST /bindings/feishu/:agentId/start
+    if (action === '/start' && method === 'POST') {
+      if (manager.isRunning(agentId)) {
+        return json({ status: 'already_running', agentId });
+      }
+      try {
+        await manager.start(agentId);
+        return json({ status: 'started', agentId, ...manager.getStatus(agentId) });
+      } catch (err) {
+        return json({ error: 'Failed to start gateway', reason: safeErrorMessage(err) }, 500);
+      }
+    }
+
+    // POST /bindings/feishu/:agentId/stop
+    if (action === '/stop' && method === 'POST') {
+      if (!manager.isRunning(agentId)) {
+        return json({ status: 'not_running', agentId });
+      }
+      manager.stop(agentId);
+      return json({ status: 'stopped', agentId });
+    }
+
+    // POST /bindings/feishu/:agentId/restart
+    if (action === '/restart' && method === 'POST') {
+      try {
+        await manager.restart(agentId);
+        return json({ status: 'restarted', agentId, ...manager.getStatus(agentId) });
+      } catch (err) {
+        return json({ error: 'Failed to restart gateway', reason: safeErrorMessage(err) }, 500);
+      }
+    }
+
+    // POST /bindings/feishu/:agentId/probe — test Feishu credentials
+    if (action === '/probe' && method === 'POST') {
+      try {
+        // Import probeFeishu from the built plugin dist
+        const { probeFeishu } = await import('@larksuite/openclaw-lark');
+        const result = await (probeFeishu as (creds: { appId: string; appSecret: string }) => Promise<{ ok: boolean; error?: string }>)({
+          appId: binding.config.appId,
+          appSecret: binding.config.appSecret,
+        });
+        return json({ agentId, probe: result });
+      } catch (err) {
+        return json({
+          agentId,
+          probe: { ok: false, error: safeErrorMessage(err) },
+        });
+      }
+    }
+
+    // POST /bindings/feishu/:agentId/auth — trigger OAuth / onboarding
+    if (action === '/auth' && method === 'POST') {
+      let body: { userOpenId?: string; accountId?: string; locale?: string };
+      try {
+        body = req.headers.get('content-length') !== '0' && req.headers.get('content-type')?.includes('json')
+          ? (await req.json()) as typeof body
+          : {};
+      } catch {
+        body = {};
+      }
+
+      const entry = manager.getEntry(agentId);
+      if (!entry) {
+        return json({
+          error: `Agent "${agentId}" is not currently running. Start it first via POST /bindings/feishu/${agentId}/start`,
+        }, 409);
+      }
+
+      if (!body.userOpenId) {
+        return json({
+          error: 'Missing required field: userOpenId',
+          hint: 'Provide the Feishu open_id of the user who should receive the OAuth authorization request.',
+        }, 400);
+      }
+
+      try {
+        // runFeishuAuth requires an AsyncLocalStorage ticket (getTicket()).
+        // We provide a synthetic one so the function can identify the sender.
+        const { runFeishuAuth } = await import('../src/commands/auth.ts');
+        const { withTicket } = await import('../src/core/lark-ticket.ts');
+
+        const accountId = body.accountId ?? 'default';
+        const locale = (body.locale ?? 'zh_cn') as 'zh_cn' | 'en_us';
+
+        const result = await withTicket(
+          {
+            messageId: `http_auth_${Date.now()}`,
+            chatId: 'http',
+            accountId,
+            startTime: Date.now(),
+            senderOpenId: body.userOpenId,
+          },
+          () => runFeishuAuth(entry.feishuCfg, locale),
+        ) as string;
+
+        return json({ agentId, accountId, userOpenId: body.userOpenId, message: result });
+      } catch (err) {
+        console.error(`[server] auth error for agent "${agentId}":`, err);
+        return json({
+          error: 'Auth flow failed',
+          reason: safeErrorMessage(err),
+        }, 500);
+      }
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // A2A direct access (for testing / introspection)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // GET /a2a/status?url=http://...  or uses first binding's a2aAgentUrl
+  if (pathname === '/a2a/status' && method === 'GET') {
+    const agentUrl =
+      url.searchParams.get('url') ||
+      registry.list()[0]?.a2aAgentUrl ||
+      ENV_A2A_AGENT_URL;
+
+    if (!agentUrl) {
+      return json({
+        enabled: false,
+        message: 'Provide ?url= param or register a binding first',
+      });
+    }
+    try {
+      const runtime = createA2APluginRuntime({ agentUrl });
+      const card = await runtime.a2a.getAgentCard();
+      return json({ enabled: true, agentUrl, agentCard: card });
+    } catch (err) {
+      return json({ enabled: false, agentUrl, error: safeErrorMessage(err) }, 503);
+    }
+  }
+
+  // POST /a2a/run
+  if (pathname === '/a2a/run' && method === 'POST') {
+    let body: {
+      message: string;
+      agentUrl?: string;
+      sessionKey?: string;
+      wait?: boolean;
+      timeoutMs?: number;
+    };
+    try {
+      body = (await req.json()) as typeof body;
+    } catch {
+      return json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    const agentUrl =
+      body.agentUrl ||
+      registry.list()[0]?.a2aAgentUrl ||
+      ENV_A2A_AGENT_URL;
+
+    if (!agentUrl) {
+      return json(
+        { error: 'No A2A agent URL. Pass "agentUrl" in body or register a binding.' },
+        501,
+      );
+    }
+    if (!body.message) return json({ error: 'Missing required field: message' }, 400);
+
+    const runtime = createA2APluginRuntime({ agentUrl });
+    const subagent = runtime.subagent as {
       run: (p: { sessionKey: string; message: string }) => Promise<{ runId: string }>;
       waitForRun: (p: { runId: string; timeoutMs?: number }) => Promise<{ status: string; error?: string }>;
       getSessionMessages: (p: { sessionKey: string }) => Promise<{ messages: unknown[] }>;
     };
 
     const sessionKey = body.sessionKey || `demo_session_${Date.now()}`;
-
     try {
-      const runResult = await subagent.run({ sessionKey, message: body.message });
-
+      const { runId } = await subagent.run({ sessionKey, message: body.message });
       if (body.wait !== false) {
-        const waitResult = await subagent.waitForRun({
-          runId: runResult.runId,
-          timeoutMs: body.timeoutMs,
-        });
-        const messages = await subagent.getSessionMessages({ sessionKey });
-        return json({ runId: runResult.runId, sessionKey, ...waitResult, messages: messages.messages });
+        const waitResult = await subagent.waitForRun({ runId, timeoutMs: body.timeoutMs });
+        const { messages } = await subagent.getSessionMessages({ sessionKey });
+        return json({ runId, sessionKey, ...waitResult, messages });
       }
-
-      return json({ runId: runResult.runId, sessionKey, status: 'submitted' });
+      return json({ runId, sessionKey, status: 'submitted' });
     } catch (err) {
-      return json({
-        error: 'A2A agent call failed',
-        reason: safeErrorMessage(err),
-      }, 502);
+      return json({ error: 'A2A agent call failed', reason: safeErrorMessage(err) }, 502);
     }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Gateway endpoints
-  // ---------------------------------------------------------------------------
-
-  // GET /gateway/status — Feishu WebSocket gateway status
-  if (pathname === '/gateway/status' && req.method === 'GET') {
-    return json({
-      running: plugin?.gatewayRunning ?? false,
-      feishuCredentials: hasFeishuCredentials,
-      a2aEnabled: plugin?.a2aEnabled ?? false,
-      feishuAppId: FEISHU_APP_ID || null,
-      feishuDomain: FEISHU_DOMAIN,
-      requireMention: FEISHU_REQUIRE_MENTION,
-      dmPolicy: FEISHU_DM_POLICY,
-      message: !hasFeishuCredentials
-        ? 'Set FEISHU_APP_ID and FEISHU_APP_SECRET env vars to enable the gateway'
-        : !A2A_AGENT_URL
-          ? 'Set A2A_AGENT_URL env var to route messages to an A2A agent'
-          : plugin?.gatewayRunning
-            ? 'Gateway is running — Feishu messages are being forwarded to the A2A agent'
-            : 'Gateway is stopped',
-    });
-  }
-
-  // POST /gateway/start — start the Feishu WebSocket gateway
-  if (pathname === '/gateway/start' && req.method === 'POST') {
-    if (!plugin) {
-      return json({ error: 'Plugin not loaded', reason: pluginError }, 500);
-    }
-    if (!hasFeishuCredentials) {
-      return json(
-        { error: 'Feishu credentials not configured. Set FEISHU_APP_ID and FEISHU_APP_SECRET env vars.' },
-        501,
-      );
-    }
-    if (plugin.gatewayRunning) {
-      return json({ status: 'already_running', message: 'Feishu gateway is already running' });
-    }
-    try {
-      await plugin.startGateway();
-      return json({ status: 'started', message: 'Feishu WebSocket gateway started' });
-    } catch (err) {
-      return json({
-        error: 'Failed to start gateway',
-        reason: safeErrorMessage(err),
-      }, 500);
-    }
-  }
-
-  // DELETE /gateway/stop — stop the Feishu WebSocket gateway
-  if (pathname === '/gateway/stop' && req.method === 'DELETE') {
-    if (!plugin) {
-      return json({ error: 'Plugin not loaded', reason: pluginError }, 500);
-    }
-    if (!plugin.gatewayRunning) {
-      return json({ status: 'not_running', message: 'Feishu gateway is not running' });
-    }
-    plugin.stopGateway();
-    return json({ status: 'stopped', message: 'Feishu WebSocket gateway stopped' });
   }
 
   return json({ error: 'Not Found' }, 404);
@@ -367,36 +514,27 @@ async function handleRequest(req: Request): Promise<Response> {
 // Server
 // ---------------------------------------------------------------------------
 
-const server = Bun.serve({
-  port: PORT,
-  fetch: handleRequest,
-});
+const server = Bun.serve({ port: PORT, fetch: handleRequest });
 
-const feishuStatus = hasFeishuCredentials
-  ? `✅ ${FEISHU_APP_ID} (${FEISHU_DOMAIN})`
-  : '⚠️  not configured (set FEISHU_APP_ID + FEISHU_APP_SECRET)';
-
-const gatewayStatus = plugin?.gatewayRunning
-  ? '✅ running'
-  : hasFeishuCredentials && !A2A_AGENT_URL
-    ? '⚠️  set A2A_AGENT_URL to auto-start'
-    : '⚠️  not started';
+const bindingCount = registry.size;
+const runningCount = manager.listEntries().filter((e) => e.plugin.gatewayRunning).length;
 
 console.info([
   '',
-  '  ╔═══════════════════════════════════════╗',
-  '  ║  OpenClaw Lark Plugin — Demo Server  ║',
-  '  ╚═══════════════════════════════════════╝',
-  `  Plugin loaded : ${plugin ? '✅ yes' : '❌ no'}`,
-  `  Echo bot      : ✅ ready`,
-  `  Feishu creds  : ${feishuStatus}`,
-  `  A2A runtime   : ${plugin?.a2aEnabled ? `✅ ${A2A_AGENT_URL}` : '⚠️  not configured (set A2A_AGENT_URL)'}`,
-  `  Gateway       : ${gatewayStatus}`,
-  `  Server        : http://localhost:${PORT}`,
+  '  ╔═══════════════════════════════════════════╗',
+  '  ║  OpenClaw Lark Plugin — Demo Server v2   ║',
+  '  ╚═══════════════════════════════════════════╝',
+  `  Echo bot     : ✅ ready`,
+  `  Bindings     : ${bindingCount} registered, ${runningCount} gateway(s) running`,
+  `  Server       : http://localhost:${PORT}`,
   '',
-  `  Try it: curl http://localhost:${PORT}/`,
-  `          curl -X POST http://localhost:${PORT}/message -H 'Content-Type: application/json' -d '{"text":"Hello!"}'`,
-  `          curl http://localhost:${PORT}/gateway/status`,
+  `  Quick start:`,
+  `    curl http://localhost:${PORT}/`,
+  `    curl -X POST http://localhost:${PORT}/bindings/feishu \\`,
+  `      -H 'Content-Type: application/json' \\`,
+  `      -d '{"agentId":"my-agent","a2aAgentUrl":"http://localhost:4000",`,
+  `          "appId":"cli_xxx","appSecret":"xxx"}'`,
+  `    curl http://localhost:${PORT}/bindings`,
   '',
 ].join('\n'));
 
