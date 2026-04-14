@@ -1,0 +1,13 @@
+{
+  "name": "openclaw-lark-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run server.ts",
+    "dev": "bun --watch run server.ts"
+  },
+  "dependencies": {
+    "@larksuite/openclaw-lark": "link:.."
+  }
+}

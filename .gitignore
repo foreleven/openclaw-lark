@@ -21,6 +21,8 @@ src/tools/docs/
 /docs/
 
 /**/package-lock.json
+/**/bun.lock
+/**/bun.lockb
 /**/.DS_Store
 
 .eslintcache
