@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "start": "bun run server.ts",
-    "dev": "bun --watch run server.ts"
+    "dev": "bun --watch run server.ts",
+    "mock-agent": "bun run mock-a2a-agent.ts"
   },
   "dependencies": {
-    "@larksuite/openclaw-lark": "link:.."
+    "@larksuite/openclaw-lark": "link:..",
+    "a2a-js": "^0.2.0"
   }
 }

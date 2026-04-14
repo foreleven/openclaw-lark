@@ -242,7 +242,7 @@ export interface PluginRegistrationResult {
 // ---------------------------------------------------------------------------
 
 export function createMockPluginApi(
-  overrides?: Partial<{ config: OpenClawConfig }>,
+  overrides?: Partial<{ config: OpenClawConfig; runtime: Record<string, unknown> }>,
 ): { api: Record<string, unknown>; result: PluginRegistrationResult } {
   const channels: ChannelRegistration[] = [];
   const tools: ToolRegistration[] = [];
@@ -269,18 +269,20 @@ export function createMockPluginApi(
     registrationMode: 'native',
     config,
     pluginConfig: {},
-    runtime: buildMockPluginRuntime(),
+    runtime: overrides?.runtime ?? buildMockPluginRuntime(),
     logger,
 
     // ---- Registration methods ----
 
     registerChannel: (registration: ChannelRegistration | ChannelPlugin) => {
-      if ('plugin' in (registration as ChannelRegistration)) {
-        channels.push(registration as ChannelRegistration);
+      let channelReg: ChannelRegistration;
+      if ('plugin' in registration && typeof (registration as ChannelRegistration).plugin === 'object') {
+        channelReg = registration as ChannelRegistration;
       } else {
-        channels.push({ plugin: registration as ChannelPlugin });
+        channelReg = { plugin: registration as ChannelPlugin };
       }
-      console.info(`[plugin-loader] channel registered: ${(registration as ChannelRegistration).plugin?.id ?? (registration as ChannelPlugin).id}`);
+      channels.push(channelReg);
+      console.info(`[plugin-loader] channel registered: ${channelReg.plugin.id}`);
     },
 
     registerTool: (tool: unknown, opts?: unknown) => {

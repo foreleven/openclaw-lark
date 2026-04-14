@@ -1,46 +1,59 @@
 # OpenClaw Lark Plugin — Demo Server
 
-A self-contained [Bun](https://bun.sh) HTTP server that loads the `@larksuite/openclaw-lark` channel plugin and wires it to a mock **Echo Bot**.
+A self-contained [Bun](https://bun.sh) HTTP server that loads the `@larksuite/openclaw-lark` channel plugin and wires it to a mock **Echo Bot** and an optional **A2A-backed plugin runtime**.
 
 This demo shows how to:
 
 1. **Load a channel plugin** outside the official OpenClaw runtime by providing a lightweight mock of `OpenClawPluginApi`
 2. **Inspect registration results** — channels, tools, hooks and commands the plugin registered
 3. **Simulate inbound messages** and get echo replies through a simple REST API
+4. **Delegate sub-agent calls to a remote A2A agent** using the `a2a-plugin-runtime`
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) v1.0+ (or Node.js 22+ with `--experimental-strip-types`)
+- [Bun](https://bun.sh) v1.0+
 - The parent plugin must be built first (`pnpm build` in the repo root)
 
 ## Quick Start
 
 ```bash
 # 1. Build the parent plugin (from repo root)
-pnpm install
-pnpm build
+pnpm install && pnpm build
 
 # 2. Install demo dependencies
-cd demo
-bun install
+cd demo && pnpm install
 
-# 3. Start the server
+# 3a. Start the server without A2A (echo bot only)
 bun run server.ts
+
+# 3b. Start with A2A runtime + bundled mock agent
+MOCK_A2A_PORT=4000 bun run mock-a2a-agent.ts &
+A2A_AGENT_URL=http://localhost:4000 bun run server.ts
 ```
 
 The server starts on `http://localhost:3000` (override with `PORT` env var).
 
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `3000` | HTTP server port |
+| `A2A_AGENT_URL` | _(none)_ | URL of a remote A2A-compatible agent; enables the full A2A runtime |
+| `MOCK_A2A_PORT` | `4000` | Port for the bundled mock A2A agent |
+
 ## API Endpoints
 
-| Method | Path       | Description                              |
-|--------|-----------|------------------------------------------|
-| GET    | `/`       | Health check & plugin info               |
-| GET    | `/plugin` | Detailed plugin registration info        |
-| POST   | `/message`| Send a simulated inbound message         |
-| GET    | `/history`| Get echo bot conversation history        |
-| POST   | `/clear`  | Clear conversation history               |
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/` | Health check, plugin info & A2A status |
+| GET | `/plugin` | Detailed plugin registration info |
+| POST | `/message` | Send a simulated inbound channel message |
+| GET | `/history` | Get echo bot conversation history |
+| POST | `/clear` | Clear conversation history |
+| GET | `/a2a/status` | A2A runtime connection status & agent card |
+| POST | `/a2a/run` | Dispatch a sub-agent task via the A2A runtime |
 
-### Example: Send a message
+### Example: Echo bot message
 
 ```bash
 curl -X POST http://localhost:3000/message \
@@ -48,67 +61,59 @@ curl -X POST http://localhost:3000/message \
   -d '{"text": "Hello, Feishu!"}'
 ```
 
-Response:
-
-```json
-{
-  "inbound": {
-    "messageId": "msg_1234567890",
-    "chatId": "demo_chat_001",
-    "senderId": "user_001",
-    "text": "Hello, Feishu!",
-    "chatType": "p2p"
-  },
-  "reply": {
-    "messageId": "echo_1_1234567890",
-    "chatId": "demo_chat_001",
-    "text": "🤖 Echo: Hello, Feishu!"
-  }
-}
-```
-
-### Example: Custom sender & chat
+### Example: A2A sub-agent run
 
 ```bash
-curl -X POST http://localhost:3000/message \
+# requires A2A_AGENT_URL to be set
+curl -X POST http://localhost:3000/a2a/run \
   -H "Content-Type: application/json" \
-  -d '{
-    "text": "Hi from group!",
-    "chatId": "group_chat_42",
-    "senderId": "ou_abc123",
-    "chatType": "group"
-  }'
+  -d '{"message": "What is 2+2?", "sessionKey": "my-session"}'
+```
+
+Response:
+```json
+{
+  "runId": "9ef4eeb1-...",
+  "sessionKey": "my-session",
+  "status": "ok",
+  "messages": [
+    { "role": "user",  "content": "What is 2+2?" },
+    { "role": "agent", "content": "4" }
+  ]
+}
 ```
 
 ## Architecture
 
 ```
 demo/
-├── server.ts              # Bun HTTP server entry point
+├── server.ts                  # Bun HTTP server entry point
+├── mock-a2a-agent.ts          # Minimal mock A2A agent for local testing
 ├── lib/
-│   ├── mock-sdk.ts        # Lightweight mock of openclaw/plugin-sdk
-│   ├── plugin-loader.ts   # Imports & registers the Lark channel plugin
-│   └── echo-bot.ts        # Simple echo bot that replies to messages
-├── package.json
-├── tsconfig.json
-└── README.md
+│   ├── a2a-plugin-runtime.ts  # A2A-backed PluginRuntime implementation ★
+│   ├── mock-sdk.ts            # Lightweight mock of openclaw/plugin-sdk
+│   ├── plugin-loader.ts       # Imports & registers the Lark channel plugin
+│   └── echo-bot.ts            # Simple echo bot for local message testing
+└── package.json
 ```
 
-### Plugin Loader Flow
+### A2A Plugin Runtime (`lib/a2a-plugin-runtime.ts`)
 
-```
-server.ts
-  └─ plugin-loader.ts
-       ├─ Creates a mock OpenClawPluginApi (mock-sdk.ts)
-       ├─ Imports ../../dist/index.mjs (built Lark plugin)
-       ├─ Calls plugin.register(mockApi)
-       └─ Collects: channels, tools, hooks, commands
-```
+Replaces no-op stubs with real implementations:
 
-The mock SDK implements just enough of the `OpenClawPluginApi` interface for the plugin's `register()` method to succeed. Methods not needed for registration are stubbed as no-ops with console warnings.
-
-### Echo Bot
-
-The Echo Bot is intentionally minimal — it receives `InboundMessagePayload` objects and returns `EchoBotReply` with the text prefixed by `🤖 Echo:`. It maintains an in-memory conversation history for debugging.
-
-To replace it with a real LLM agent, swap out the `bot.handleMessage()` call in `server.ts` with your own agent dispatch logic.
+| Namespace | Implementation |
+|-----------|----------------|
+| `subagent.run()` | `A2AClient.sendTask()` — submits to remote A2A agent |
+| `subagent.waitForRun()` | Polls `A2AClient.getTask()` until terminal state |
+| `subagent.getSessionMessages()` | Returns task history from A2A |
+| `subagent.deleteSession()` | `A2AClient.cancelTask()` for all session tasks |
+| `channel.text.*` | In-process text chunking & command detection |
+| `channel.routing.*` | Deterministic session-key builder |
+| `channel.session.*` | In-memory session metadata store |
+| `channel.pairing.*` | In-memory allow-from store |
+| `channel.activity.*` | In-memory activity log |
+| `channel.media.*` | HTTP fetch + file system save |
+| `channel.debounce.*` | setTimeout-based debouncer |
+| `runtime.agent.*` | File system workspace paths |
+| `runtime.system.runCommandWithTimeout` | `child_process.spawn` wrapper |
+| `runtime.a2a` | Direct `A2AClient` / `A2ACardResolver` access |
