@@ -263,7 +263,7 @@ export function createA2APluginRuntime(options: A2APluginRuntimeOptions): A2APlu
       if (taskIds.length === 0) return { messages: [] };
 
       // Use the latest task in the session (length > 0 is guaranteed by the check above)
-      const latestTaskId = taskIds[taskIds.length - 1] as string;
+      const latestTaskId = taskIds[taskIds.length - 1]!
       let task: Task | null = stores.taskCache.get(latestTaskId) ?? null;
 
       if (!task) {

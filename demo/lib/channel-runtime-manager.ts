@@ -104,6 +104,8 @@ export class ChannelRuntimeManager {
           dmPolicy: cfg.dmPolicy ?? 'open',
           requireMention: cfg.requireMention ?? false,
           enabled: true,
+          // 'brand' is the plugin-internal field for the Feishu/Lark domain;
+          // users configure it as 'domain' in the binding for clarity.
           ...(cfg.domain ? { brand: cfg.domain } : {}),
         },
       },

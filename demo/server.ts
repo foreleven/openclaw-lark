@@ -407,21 +407,22 @@ async function handleRequest(req: Request): Promise<Response> {
         const { runFeishuAuth } = await import('../src/commands/auth.ts');
         const { withTicket } = await import('../src/core/lark-ticket.ts');
 
-        const accountId = body.accountId ?? 'default';
         const locale = (body.locale ?? 'zh_cn') as 'zh_cn' | 'en_us';
+        const resolvedAccountId = body.accountId ?? 'default';
 
         const result = await withTicket(
           {
             messageId: `http_auth_${Date.now()}`,
             chatId: 'http',
-            accountId,
+            accountId: resolvedAccountId,
+            // startTime: timestamp when this HTTP request initiated the auth flow
             startTime: Date.now(),
             senderOpenId: body.userOpenId,
           },
           () => runFeishuAuth(entry.feishuCfg, locale),
         ) as string;
 
-        return json({ agentId, accountId, userOpenId: body.userOpenId, message: result });
+        return json({ agentId, accountId: resolvedAccountId, userOpenId: body.userOpenId, message: result });
       } catch (err) {
         console.error(`[server] auth error for agent "${agentId}":`, err);
         return json({
