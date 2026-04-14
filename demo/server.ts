@@ -79,7 +79,7 @@ try {
   // Log full error to console for debugging, but only expose the message
   // to HTTP responses (avoid stack-trace leakage).
   console.error('[server] plugin load failed:', err);
-  pluginError = err instanceof Error ? err.message : 'Plugin load failed';
+  pluginError = safeErrorMessage(err);
 }
 
 // Auto-start the Feishu gateway when all required credentials are available
@@ -101,6 +101,19 @@ function json(data: unknown, status = 200): Response {
     status,
     headers: { 'Content-Type': 'application/json; charset=utf-8' },
   });
+}
+
+/**
+ * Return a safe error summary for HTTP responses.
+ * Strips stack trace lines and file paths so internal details don't leak
+ * to clients. Full errors are always logged to console for debugging.
+ */
+function safeErrorMessage(err: unknown): string {
+  if (!(err instanceof Error)) return 'An error occurred';
+  // Strip stack trace lines (lines starting with whitespace followed by "at ")
+  const msg = err.message.split('\n')[0] ?? '';
+  // Remove file paths (e.g. /home/runner/... or C:\Users\...)
+  return msg.replace(/\/[^\s:]+|[A-Z]:\\[^\s:]*/g, '[path]').trim() || 'An error occurred';
 }
 
 // ---------------------------------------------------------------------------
@@ -225,14 +238,13 @@ async function handleRequest(req: Request): Promise<Response> {
     // Probe the agent card
     try {
       const a2aRuntime = createA2APluginRuntime({ agentUrl: A2A_AGENT_URL });
-      const a2aExt = a2aRuntime['a2a'] as { getAgentCard: () => Promise<unknown> };
-      const card = await a2aExt.getAgentCard();
+      const card = await a2aRuntime.a2a.getAgentCard();
       return json({ enabled: true, agentUrl: A2A_AGENT_URL, agentCard: card });
     } catch (err) {
       return json({
         enabled: false,
         agentUrl: A2A_AGENT_URL,
-        error: err instanceof Error ? err.message : String(err),
+        error: safeErrorMessage(err),
       }, 503);
     }
   }
@@ -258,7 +270,7 @@ async function handleRequest(req: Request): Promise<Response> {
     }
 
     const a2aRuntime = createA2APluginRuntime({ agentUrl: A2A_AGENT_URL });
-    const subagent = a2aRuntime['subagent'] as {
+    const subagent = a2aRuntime.subagent as {
       run: (p: { sessionKey: string; message: string }) => Promise<{ runId: string }>;
       waitForRun: (p: { runId: string; timeoutMs?: number }) => Promise<{ status: string; error?: string }>;
       getSessionMessages: (p: { sessionKey: string }) => Promise<{ messages: unknown[] }>;
@@ -282,7 +294,7 @@ async function handleRequest(req: Request): Promise<Response> {
     } catch (err) {
       return json({
         error: 'A2A agent call failed',
-        reason: err instanceof Error ? err.message : String(err),
+        reason: safeErrorMessage(err),
       }, 502);
     }
   }
@@ -331,7 +343,7 @@ async function handleRequest(req: Request): Promise<Response> {
     } catch (err) {
       return json({
         error: 'Failed to start gateway',
-        reason: err instanceof Error ? err.message : String(err),
+        reason: safeErrorMessage(err),
       }, 500);
     }
   }

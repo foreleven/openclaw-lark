@@ -68,8 +68,32 @@ export interface A2APluginRuntimeOptions {
 }
 
 // ---------------------------------------------------------------------------
-// In-memory stores (replace file-backed store stubs)
+// A2A runtime return type
 // ---------------------------------------------------------------------------
+
+/** A2A-specific extension surface (not part of standard PluginRuntime). */
+export interface A2ARuntimeExtensions {
+  client: unknown;
+  cardResolver: unknown;
+  getAgentCard: () => Promise<unknown>;
+  getSessionTaskIds: (sessionKey: string) => string[];
+  getCachedTask: (taskId: string) => unknown;
+}
+
+export interface A2APluginRuntime {
+  version: string;
+  config: { loadConfig: () => Record<string, unknown>; writeConfigFile: (cfg: unknown) => void };
+  agent: Record<string, unknown>;
+  system: Record<string, unknown>;
+  media: Record<string, unknown>;
+  channel: Record<string, unknown>;
+  subagent: Record<string, unknown>;
+  tts: Record<string, unknown>;
+  mediaUnderstanding: Record<string, unknown>;
+  imageGeneration: Record<string, unknown>;
+  /** A2A-specific extensions (not part of standard PluginRuntime). */
+  a2a: A2ARuntimeExtensions;
+}
 
 type ActivityRecord = { channelId: string; accountId?: string; ts: number };
 type PairingEntry = { channel: string; accountId: string; userId: string; approved: boolean };
@@ -105,7 +129,7 @@ const TERMINAL_STATES = new Set<string>([
 // Factory
 // ---------------------------------------------------------------------------
 
-export function createA2APluginRuntime(options: A2APluginRuntimeOptions): Record<string, unknown> {
+export function createA2APluginRuntime(options: A2APluginRuntimeOptions): A2APluginRuntime {
   const {
     agentUrl,
     workspaceBaseDir = path.join(os.tmpdir(), 'openclaw-demo', 'workspaces'),
