@@ -53,7 +53,7 @@ import { EchoBot, type InboundMessagePayload } from './lib/echo-bot.ts';
 import { createA2APluginRuntime } from './lib/a2a-plugin-runtime.ts';
 import { ChannelRegistry, type FeishuChannelConfig } from './lib/channel-registry.ts';
 import { ChannelRuntimeManager } from './lib/channel-runtime-manager.ts';
-import { FeishuSetupService, buildSetupPage, DEFAULT_SETUP_AGENT_ID } from './lib/feishu-setup.ts';
+import { FeishuSetupService, buildSetupPage, DEFAULT_SETUP_AGENT_ID, generateQrSvg } from './lib/feishu-setup.ts';
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -164,6 +164,7 @@ async function handleRequest(req: Request): Promise<Response> {
         'POST /a2a/run': 'Dispatch task to remote A2A agent',
         'GET  /setup/feishu': 'Feishu bot setup page (QR code scan to bind)',
         'POST /setup/feishu/start': 'Start Feishu QR device-flow session',
+        'GET  /setup/feishu/qr.svg': 'Server-side QR code SVG image (query: ?data=)',
         'GET  /setup/feishu/status/:sessionId': 'Poll QR session status',
       },
     });
@@ -534,6 +535,23 @@ async function handleRequest(req: Request): Promise<Response> {
     });
   }
 
+  // GET /setup/feishu/qr.svg?data=URL — Server-side QR code image (SVG)
+  if (pathname === '/setup/feishu/qr.svg' && method === 'GET') {
+    const data = url.searchParams.get('data');
+    if (!data) return new Response('Missing ?data= parameter', { status: 400 });
+    const svg = await generateQrSvg(data);
+    if (!svg) {
+      return new Response('QR code generation unavailable (qrcode package missing)', { status: 503 });
+    }
+    return new Response(svg, {
+      status: 200,
+      headers: {
+        'Content-Type': 'image/svg+xml; charset=utf-8',
+        'Cache-Control': 'public, max-age=300',
+      },
+    });
+  }
+
   // POST /setup/feishu/start — Initiate Feishu device-flow QR session
   if (pathname === '/setup/feishu/start' && method === 'POST') {
     let body: {
@@ -607,6 +625,8 @@ async function handleRequest(req: Request): Promise<Response> {
 const server = Bun.serve({ port: PORT, fetch: handleRequest });
 
 // Periodically clean up expired QR sessions (every 30 minutes).
+// The interval is intentionally un-tracked: the server runs for its full
+// lifetime and the timer should never be cancelled.
 setInterval(() => setup.cleanupExpired(), 30 * 60 * 1000);
 
 const bindingCount = registry.size;

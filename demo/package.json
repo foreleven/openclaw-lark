@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@larksuite/openclaw-lark": "link:..",
-    "a2a-js": "^0.2.0"
+    "a2a-js": "^0.2.0",
+    "qrcode": "^1.5.4"
   }
 }

@@ -9,6 +9,8 @@
  *   2. `startQrFlow()` calls `requestDeviceAuthorization()` to obtain a
  *      `device_code` and a `verificationUriComplete` URL.
  *   3. The `verificationUriComplete` is rendered as a QR code on the setup page.
+ *      The QR image is generated server-side (via the `qrcode` npm package) and
+ *      served from `GET /setup/feishu/qr.svg?data=…` — no CDN dependencies.
  *   4. The Feishu app user scans the QR code and approves the authorization.
  *   5. Background polling (`pollDeviceToken`) detects completion and fires
  *      `registerBinding()` which creates the ChannelRegistry entry and
@@ -23,6 +25,39 @@ import {
 } from '../../src/core/device-flow.ts';
 import type { ChannelRegistry } from './channel-registry.ts';
 import type { ChannelRuntimeManager } from './channel-runtime-manager.ts';
+
+// ---------------------------------------------------------------------------
+// QR code generation (server-side, no CDN dependency)
+// ---------------------------------------------------------------------------
+
+// Imported lazily so the module can be loaded even if qrcode is absent.
+// `qrcode` is a CJS module so we use createRequire.
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import { dirname } from 'node:path';
+
+const _require = createRequire(import.meta.url ?? fileURLToPath(import.meta.url));
+
+/**
+ * Generate an SVG string for the given URL using the `qrcode` npm package.
+ * Returns null if the package is not installed.
+ */
+export async function generateQrSvg(url: string): Promise<string | null> {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const QRCode = _require('qrcode') as {
+      toString: (text: string, opts: Record<string, unknown>, cb: (err: Error | null, str: string) => void) => void;
+    };
+    return await new Promise<string>((resolve, reject) => {
+      QRCode.toString(url, { type: 'svg', margin: 2, width: 220 }, (err, str) => {
+        if (err) reject(err);
+        else resolve(str);
+      });
+    });
+  } catch {
+    return null;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Hardcoded agent ID
@@ -308,8 +343,8 @@ export function buildSetupPage(opts: {
     button[type="submit"]:disabled { background: #8ab4f8; cursor: not-allowed; }
     #qr-section { display: none; text-align: center; }
     #qr-section.visible { display: block; }
-    #qr-code { margin: 20px auto; }
-    #qr-code canvas, #qr-code img { border: 4px solid #e6e8ed; border-radius: 8px; }
+    #qr-code { margin: 20px auto; line-height: 0; }
+    #qr-code img, #qr-code svg { border: 4px solid #e6e8ed; border-radius: 8px; }
     .user-code {
       font-size: 28px;
       font-weight: 700;
@@ -357,8 +392,18 @@ export function buildSetupPage(opts: {
     }
     .back-link { display: block; text-align: center; margin-top: 24px; font-size: 13px; }
     .back-link a { color: #0066ff; text-decoration: none; }
+    .form-error {
+      background: #fde8e8;
+      color: #b91c1c;
+      border: 1px solid #fca5a5;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      margin-bottom: 16px;
+      display: none;
+    }
+    .form-error.visible { display: block; }
   </style>
-  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
 </head>
 <body>
 <div class="card">
@@ -366,6 +411,8 @@ export function buildSetupPage(opts: {
   <p class="subtitle">扫描二维码，完成飞书机器人绑定（Agent ID: <strong>1</strong>）</p>
 
   ${alreadyRegistered ? `<div class="badge-registered">✅ Agent "1" 已绑定，可重新配置覆盖</div>` : ''}
+
+  <div id="form-error" class="form-error" role="alert" aria-live="assertive"></div>
 
   <form id="setup-form">
     <div class="field">
@@ -419,6 +466,7 @@ export function buildSetupPage(opts: {
   let currentSessionId = null;
 
   const form = document.getElementById('setup-form');
+  const formError = document.getElementById('form-error');
   const qrSection = document.getElementById('qr-section');
   const submitBtn = document.getElementById('submit-btn');
   const qrCodeDiv = document.getElementById('qr-code');
@@ -427,8 +475,20 @@ export function buildSetupPage(opts: {
   const statusBar = document.getElementById('status-bar');
   const restartLink = document.getElementById('restart-link');
 
+  function showFormError(msg) {
+    formError.textContent = msg;
+    formError.classList.add('visible');
+    formError.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  function hideFormError() {
+    formError.classList.remove('visible');
+    formError.textContent = '';
+  }
+
   form.addEventListener('submit', async function (e) {
     e.preventDefault();
+    hideFormError();
     const appId = document.getElementById('appId').value.trim();
     const appSecret = document.getElementById('appSecret').value.trim();
     const brand = document.getElementById('brand').value;
@@ -450,7 +510,7 @@ export function buildSetupPage(opts: {
       if (!resp.ok) {
         submitBtn.disabled = false;
         submitBtn.textContent = '生成二维码';
-        alert('启动失败：' + (data.error || '未知错误') + (data.reason ? '\\n' + data.reason : ''));
+        showFormError('启动失败：' + (data.error || '未知错误') + (data.reason ? ' — ' + data.reason : ''));
         return;
       }
 
@@ -460,7 +520,7 @@ export function buildSetupPage(opts: {
     } catch (err) {
       submitBtn.disabled = false;
       submitBtn.textContent = '生成二维码';
-      alert('网络错误：' + err.message);
+      showFormError('网络错误：' + err.message);
     }
   });
 
@@ -468,10 +528,12 @@ export function buildSetupPage(opts: {
     e.preventDefault();
     stopPolling();
     qrSection.classList.remove('visible');
+    form.style.display = '';
     qrCodeDiv.innerHTML = '';
     submitBtn.disabled = false;
     submitBtn.textContent = '生成二维码';
     setStatus('pending', '');
+    hideFormError();
   });
 
   function showQrCode(url, userCode, verifyUrl) {
@@ -482,25 +544,13 @@ export function buildSetupPage(opts: {
     verifyLink.href = verifyUrl || url;
     verifyLink.textContent = verifyUrl || url;
 
-    // Generate QR code client-side using qrcode.js
-    if (typeof QRCode !== 'undefined') {
-      new QRCode(qrCodeDiv, {
-        text: url,
-        width: 220,
-        height: 220,
-        colorDark: '#1a1a1a',
-        colorLight: '#ffffff',
-        correctLevel: QRCode.CorrectLevel.M,
-      });
-    } else {
-      // Fallback: external service
-      const img = document.createElement('img');
-      img.src = 'https://api.qrserver.com/v1/create-qr-code/?data=' + encodeURIComponent(url) + '&size=220x220';
-      img.alt = 'QR Code';
-      img.width = 220;
-      img.height = 220;
-      qrCodeDiv.appendChild(img);
-    }
+    // QR code is generated server-side and served as SVG — no CDN dependency.
+    const img = document.createElement('img');
+    img.src = '/setup/feishu/qr.svg?data=' + encodeURIComponent(url);
+    img.alt = 'QR Code — scan with Feishu App';
+    img.width = 220;
+    img.height = 220;
+    qrCodeDiv.appendChild(img);
   }
 
   function startPolling(sessionId, intervalSecs) {
@@ -512,7 +562,7 @@ export function buildSetupPage(opts: {
         const data = await resp.json();
         updateStatus(data);
         if (data.status !== 'pending') stopPolling();
-      } catch { /* ignore network hiccups */ }
+      } catch { /* ignore transient network hiccups */ }
     }, ms);
   }
 
