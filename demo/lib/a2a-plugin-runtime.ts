@@ -57,6 +57,14 @@ export interface A2APluginRuntimeOptions {
     warn: (msg: string) => void;
     error: (msg: string) => void;
   };
+
+  /**
+   * The real Feishu/ClawdbotConfig to return from `runtime.config.loadConfig()`.
+   * When provided, the plugin's internal config access (e.g. `LarkClient.runtime.config.loadConfig()`)
+   * returns real credentials rather than an empty object.
+   * Can also be a live callback for configs that change at runtime.
+   */
+  feishuConfig?: Record<string, unknown> | (() => Record<string, unknown>);
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +111,7 @@ export function createA2APluginRuntime(options: A2APluginRuntimeOptions): Record
     workspaceBaseDir = path.join(os.tmpdir(), 'openclaw-demo', 'workspaces'),
     pollIntervalMs = 500,
     defaultWaitTimeoutMs = 60_000,
+    feishuConfig,
     log = {
       info: (msg: string) => console.info(`[a2a-runtime] ${msg}`),
       warn: (msg: string) => console.warn(`[a2a-runtime] ${msg}`),
@@ -337,29 +346,288 @@ export function createA2APluginRuntime(options: A2APluginRuntimeOptions): Record
   };
 
   // ---------------------------------------------------------------------------
-  // Channel reply (basic wiring — real dispatching still goes through feishu SDK)
+  // Channel reply — A2A-backed dispatchers
   // ---------------------------------------------------------------------------
 
+  /**
+   * Extract the user-facing message text from an inbound context payload.
+   * Prefers BodyForAgent (clean AI-facing text), falls back through Body chain.
+   */
+  function extractMessageFromCtx(ctx: Record<string, unknown>): string {
+    return (
+      (ctx['RawBody'] as string | undefined) ??
+      (ctx['CommandBody'] as string | undefined) ??
+      (ctx['BodyForAgent'] as string | undefined) ??
+      (ctx['Body'] as string | undefined) ??
+      ''
+    );
+  }
+
+  /**
+   * Extract the last agent reply text from A2A session messages.
+   */
+  async function getLastAgentReply(sessionKey: string): Promise<string> {
+    const { messages } = await subagent.getSessionMessages({ sessionKey });
+    const agentMessages = messages.filter(
+      (m) => (m as { role: string }).role === Role.Agent || (m as { role: string }).role === 'agent',
+    );
+    const last = agentMessages[agentMessages.length - 1] as { content?: string; text?: string } | undefined;
+    return last?.content ?? last?.text ?? '';
+  }
+
+  /**
+   * Core A2A dispatch: send message to agent, wait for response, return reply text.
+   */
+  async function dispatchViaA2A(
+    message: string,
+    sessionKey: string,
+    abortSignal?: AbortSignal,
+  ): Promise<{ text: string; status: 'ok' | 'error' | 'timeout'; error?: string }> {
+    if (!message.trim()) {
+      return { text: 'NO_REPLY', status: 'ok' };
+    }
+
+    log.info(`dispatchViaA2A: session=${sessionKey} message="${message.slice(0, 80)}${message.length > 80 ? '…' : ''}"`);
+
+    const { runId } = await subagent.run({ sessionKey, message });
+
+    // Wait for the A2A agent to finish, honouring the caller's abort signal
+    const waitResult = await Promise.race<{ status: 'ok' | 'error' | 'timeout'; error?: string }>([
+      subagent.waitForRun({ runId }),
+      abortSignal
+        ? new Promise<{ status: 'error'; error: string }>((resolve) => {
+            abortSignal.addEventListener('abort', () =>
+              resolve({ status: 'error', error: 'Aborted' }),
+            );
+          })
+        : Promise.resolve({ status: 'ok' } as { status: 'ok' }),
+    ]);
+
+    if (waitResult.status !== 'ok') {
+      log.warn(`dispatchViaA2A: agent returned ${waitResult.status}: ${waitResult.error ?? ''}`);
+      return { text: waitResult.error ?? 'Agent error', ...waitResult };
+    }
+
+    const text = await getLastAgentReply(sessionKey);
+    log.info(`dispatchViaA2A: agent replied (${text.length} chars)`);
+    return { text: text || 'NO_REPLY', status: 'ok' };
+  }
+
+  /**
+   * Create a minimal in-process ReplyDispatcher that wraps a `deliver` callback.
+   *
+   * The real SDK's `createReplyDispatcher` manages async queuing, error handling,
+   * and reply normalisation.  This implementation is intentionally minimal: it
+   * calls `deliver` synchronously on the Promise microtask queue and tracks
+   * pending promises so `waitForIdle()` drains correctly.
+   */
+  function createMinimalReplyDispatcher(options: {
+    deliver: (payload: Record<string, unknown>, info: { kind: string }) => Promise<void>;
+    onError?: (err: unknown, info: { kind: string }) => void;
+    onSkip?: (payload: unknown, info: { reason: string; kind: string }) => void;
+    onIdle?: () => void;
+  }) {
+    const pending: Promise<void>[] = [];
+    const queued = { tool: 0, block: 0, final: 0 };
+    const failed = { tool: 0, block: 0, final: 0 };
+    let completed = false;
+
+    const enqueue = (payload: Record<string, unknown>, kind: 'tool' | 'block' | 'final'): boolean => {
+      if (completed) return false;
+      const text = (payload.text as string | undefined)?.trim() ?? '';
+      if (!text || text === 'NO_REPLY') {
+        options.onSkip?.(payload, { reason: 'silent', kind });
+        return false;
+      }
+      queued[kind]++;
+      const p = options.deliver(payload, { kind }).catch((err) => {
+        failed[kind]++;
+        options.onError?.(err, { kind });
+      });
+      pending.push(p);
+      return true;
+    };
+
+    return {
+      sendFinalReply: (payload: Record<string, unknown>) => enqueue(payload, 'final'),
+      sendBlockReply: (payload: Record<string, unknown>) => enqueue(payload, 'block'),
+      sendToolResult: (payload: Record<string, unknown>) => enqueue(payload, 'tool'),
+      waitForIdle: async () => {
+        await Promise.allSettled(pending);
+        options.onIdle?.();
+      },
+      getQueuedCounts: () => ({ ...queued }),
+      getFailedCounts: () => ({ ...failed }),
+      markComplete: () => {
+        completed = true;
+      },
+    };
+  }
+
   const channelReply = {
-    dispatchReplyWithBufferedBlockDispatcher: (..._args: unknown[]) => {
-      log.warn('channel.reply.dispatchReplyWithBufferedBlockDispatcher — no-op in demo');
-      return Promise.resolve();
+    /**
+     * Primary dispatch path: called by `dispatchNormalMessage` in dispatch.ts.
+     *
+     * The real SDK implementation calls the LLM provider and streams results
+     * through the dispatcher. Here we call the remote A2A agent instead.
+     */
+    dispatchReplyFromConfig: async (params: {
+      ctx: Record<string, unknown>;
+      cfg: Record<string, unknown>;
+      dispatcher: {
+        sendFinalReply: (payload: Record<string, unknown>) => boolean;
+        sendBlockReply: (payload: Record<string, unknown>) => boolean;
+        sendToolResult: (payload: Record<string, unknown>) => boolean;
+        waitForIdle: () => Promise<void>;
+        markComplete: () => void;
+        getQueuedCounts: () => Record<string, number>;
+        getFailedCounts: () => Record<string, number>;
+      };
+      replyOptions?: Record<string, unknown>;
+    }): Promise<{ queuedFinal: boolean; counts: Record<string, number> }> => {
+      const message = extractMessageFromCtx(params.ctx);
+      const sessionKey =
+        (params.ctx['SessionKey'] as string | undefined) ??
+        `a2a_session_${Date.now()}`;
+
+      // Honour the caller's abort signal if provided
+      const abortSignal = params.replyOptions?.['abortSignal'] as AbortSignal | undefined;
+
+      const { text, status, error } = await dispatchViaA2A(message, sessionKey, abortSignal);
+
+      if (status !== 'ok') {
+        // Deliver a visible error message rather than silently failing
+        params.dispatcher.sendFinalReply({ text: `⚠️ Agent error: ${error ?? status}`, isError: true });
+        params.dispatcher.markComplete();
+        await params.dispatcher.waitForIdle();
+        return { queuedFinal: true, counts: { final: 1, tool: 0, block: 0 } };
+      }
+
+      let queuedFinal = false;
+      if (text && text !== 'NO_REPLY') {
+        queuedFinal = params.dispatcher.sendFinalReply({ text });
+      }
+      params.dispatcher.markComplete();
+      await params.dispatcher.waitForIdle();
+      return { queuedFinal, counts: { final: queuedFinal ? 1 : 0, tool: 0, block: 0 } };
     },
-    createReplyDispatcherWithTyping: (..._args: unknown[]) => {
-      log.warn('channel.reply.createReplyDispatcherWithTyping — no-op in demo');
-      return undefined;
+
+    /**
+     * Buffered-block dispatch path: used for comment targets (Drive doc comments).
+     *
+     * The caller provides a `deliver` callback directly; no streaming card.
+     */
+    dispatchReplyWithBufferedBlockDispatcher: async (params: {
+      ctx: Record<string, unknown>;
+      cfg: Record<string, unknown>;
+      dispatcherOptions: {
+        deliver: (payload: Record<string, unknown>, info: { kind: string }) => Promise<void>;
+        onError?: (err: unknown, info: { kind: string }) => void;
+        onSkip?: (payload: unknown, info: { reason: string; kind: string }) => void;
+        onIdle?: () => void;
+      };
+      replyOptions?: Record<string, unknown>;
+    }): Promise<{ queuedFinal: boolean; counts: Record<string, number> }> => {
+      const message = extractMessageFromCtx(params.ctx);
+      const sessionKey =
+        (params.ctx['SessionKey'] as string | undefined) ??
+        `a2a_session_${Date.now()}`;
+
+      const abortSignal = params.replyOptions?.['abortSignal'] as AbortSignal | undefined;
+      const { text, status, error } = await dispatchViaA2A(message, sessionKey, abortSignal);
+
+      if (status !== 'ok') {
+        try {
+          await params.dispatcherOptions.deliver(
+            { text: `⚠️ Agent error: ${error ?? status}`, isError: true },
+            { kind: 'final' },
+          );
+        } catch (deliverErr) {
+          params.dispatcherOptions.onError?.(deliverErr, { kind: 'final' });
+        }
+        return { queuedFinal: true, counts: { final: 1, tool: 0, block: 0 } };
+      }
+
+      if (!text || text === 'NO_REPLY') {
+        params.dispatcherOptions.onSkip?.({ text: '' }, { reason: 'silent', kind: 'final' });
+        return { queuedFinal: false, counts: { final: 0, tool: 0, block: 0 } };
+      }
+
+      try {
+        await params.dispatcherOptions.deliver({ text }, { kind: 'final' });
+      } catch (deliverErr) {
+        params.dispatcherOptions.onError?.(deliverErr, { kind: 'final' });
+      }
+      return { queuedFinal: true, counts: { final: 1, tool: 0, block: 0 } };
     },
+
+    /**
+     * Create a dispatcher with optional typing indicators.
+     *
+     * Called by `createFeishuReplyDispatcher` (src/card/reply-dispatcher.ts).
+     * The real SDK handles typing bubbles, streaming cards, etc.  Here we
+     * produce a minimal dispatcher that delegates to the `deliver` callback.
+     */
+    createReplyDispatcherWithTyping: (options: {
+      deliver: (payload: Record<string, unknown>, info: { kind: string }) => Promise<void>;
+      onError?: (err: unknown, info: { kind: string }) => void;
+      onSkip?: (payload: unknown, info: { reason: string; kind: string }) => void;
+      onIdle?: () => void;
+      typingCallbacks?: unknown;
+      onReplyStart?: () => Promise<void> | void;
+      onCleanup?: () => void;
+    }) => {
+      const dispatcher = createMinimalReplyDispatcher({
+        deliver: options.deliver,
+        onError: options.onError,
+        onSkip: options.onSkip,
+        onIdle: options.onIdle,
+      });
+
+      return {
+        dispatcher,
+        replyOptions: {
+          onReplyStart: options.onReplyStart,
+        },
+        markDispatchIdle: () => {
+          options.onIdle?.();
+        },
+        markRunComplete: () => {
+          // no-op in demo — real impl stops typing indicators
+        },
+        markFullyComplete: () => {
+          dispatcher.markComplete();
+        },
+        abortCard: async () => {
+          // no-op in demo — real impl aborts a streaming card
+        },
+      };
+    },
+
     resolveEffectiveMessagesConfig: (_cfg: unknown) => ({ maxMessages: 20, maxTokens: 8192 }),
     resolveHumanDelayConfig: (_cfg: unknown) => ({ enabled: false, minMs: 0, maxMs: 0 }),
-    dispatchReplyFromConfig: (..._args: unknown[]) => {
-      log.warn('channel.reply.dispatchReplyFromConfig — no-op in demo');
-      return Promise.resolve();
+
+    withReplyDispatcher: async (params: {
+      dispatcher: Record<string, unknown>;
+      run: () => Promise<unknown>;
+      onSettled?: () => void | Promise<void>;
+    }) => {
+      try {
+        return await params.run();
+      } finally {
+        await params.onSettled?.();
+      }
     },
-    withReplyDispatcher: (..._args: unknown[]) => {
-      log.warn('channel.reply.withReplyDispatcher — no-op in demo');
-      return Promise.resolve();
-    },
-    finalizeInboundContext: (ctx: unknown) => ctx,
+
+    /**
+     * Finalize the inbound context — adds `CommandAuthorized` default.
+     * The real SDK resolves templates, command bodies, etc.
+     */
+    finalizeInboundContext: (ctx: Record<string, unknown>, _opts?: unknown): Record<string, unknown> => ({
+      CommandAuthorized: false,
+      ...ctx,
+    }),
+
     formatAgentEnvelope: (params: { prompt: string; [k: string]: unknown }) =>
       `[envelope] ${params.prompt}`,
     formatInboundEnvelope: (params: { prompt: string; [k: string]: unknown }) =>
@@ -804,7 +1072,10 @@ export function createA2APluginRuntime(options: A2APluginRuntimeOptions): Record
   // ---------------------------------------------------------------------------
 
   const configRuntime = {
-    loadConfig: () => ({} as Record<string, unknown>),
+    loadConfig: () => {
+      if (typeof feishuConfig === 'function') return feishuConfig();
+      return feishuConfig ?? ({} as Record<string, unknown>);
+    },
     writeConfigFile: (_cfg: unknown) => {
       log.warn('runtime.config.writeConfigFile — no-op in demo');
     },
